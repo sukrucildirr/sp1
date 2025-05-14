@@ -12,12 +12,13 @@ use std::{
 };
 use web_time::Instant;
 
-use crate::shape::CoreShapeConfig;
-use crate::utils::test::MaliciousTracePVGeneratorType;
-use crate::{riscv::RiscvAir, shape::Shapeable};
+use crate::{
+    riscv::RiscvAir,
+    shape::{CoreShapeConfig, Shapeable},
+    utils::test::MaliciousTracePVGeneratorType,
+};
 use p3_maybe_rayon::prelude::*;
-use sp1_stark::MachineProvingKey;
-use sp1_stark::StarkVerifyingKey;
+use sp1_stark::{MachineProvingKey, StarkVerifyingKey};
 use thiserror::Error;
 
 use p3_field::PrimeField32;
@@ -95,7 +96,7 @@ pub fn prove_core_stream<SC: StarkGenericConfig, P: MachineProver<SC, RiscvAir<S
     shape_config: Option<&CoreShapeConfig<SC::Val>>,
     proof_tx: Sender<ShardProof<SC>>,
     shape_and_done_tx: Sender<(OrderedShape, bool)>,
-    malicious_trace_pv_generator: Option<MaliciousTracePVGeneratorType<SC::Val, P>>, // This is used for failure test cases that generate malicious traces and public values.
+    malicious_trace_pv_generator: Option<MaliciousTracePVGeneratorType<SC::Val, P>>, /* This is used for failure test cases that generate malicious traces and public values. */
     gas_calculator: Option<Box<dyn FnOnce(&RecordEstimator) -> Result<u64, Box<dyn Error>> + '_>>,
 ) -> Result<(Vec<u8>, u64), SP1CoreProverError>
 where
@@ -243,10 +244,14 @@ where
                                 state.execution_shard = record.public_values.execution_shard;
                                 state.start_pc = record.public_values.start_pc;
                                 state.next_pc = record.public_values.next_pc;
-                                state.committed_value_digest =
-                                    record.public_values.committed_value_digest;
-                                state.deferred_proofs_digest =
-                                    record.public_values.deferred_proofs_digest;
+                                if state.committed_value_digest == [0u32; 8] {
+                                    state.committed_value_digest =
+                                        record.public_values.committed_value_digest;
+                                }
+                                if state.deferred_proofs_digest == [0u32; 8] {
+                                    state.deferred_proofs_digest =
+                                        record.public_values.deferred_proofs_digest;
+                                }
                                 record.public_values = *state;
                             }
 
@@ -258,12 +263,12 @@ where
 
                             // We combine the memory init/finalize events if they are "small"
                             // and would affect performance.
-                            let mut shape_fixed_records = if done
-                                && num_cycles < 1 << 21
-                                && deferred.global_memory_initialize_events.len()
-                                    < opts.split_opts.combine_memory_threshold
-                                && deferred.global_memory_finalize_events.len()
-                                    < opts.split_opts.combine_memory_threshold
+                            let mut shape_fixed_records = if done &&
+                                num_cycles < 1 << 21 &&
+                                deferred.global_memory_initialize_events.len() <
+                                    opts.split_opts.combine_memory_threshold &&
+                                deferred.global_memory_finalize_events.len() <
+                                    opts.split_opts.combine_memory_threshold
                             {
                                 let mut records_clone = records.clone();
                                 let last_record = records_clone.last_mut();
@@ -272,8 +277,9 @@ where
                                     deferred.split(done, last_record, opts.split_opts);
                                 tracing::debug!("deferred {} records", deferred.len());
 
-                                // Update the public values & prover state for the shards which do not
-                                // contain "cpu events" before committing to them.
+                                // Update the public values & prover state for the shards which do
+                                // not contain "cpu events" before
+                                // committing to them.
                                 if !done {
                                     state.execution_shard += 1;
                                 }
@@ -325,8 +331,9 @@ where
                                 let mut deferred = deferred.split(done, None, opts.split_opts);
                                 tracing::debug!("deferred {} records", deferred.len());
 
-                                // Update the public values & prover state for the shards which do not
-                                // contain "cpu events" before committing to them.
+                                // Update the public values & prover state for the shards which do
+                                // not contain "cpu events" before
+                                // committing to them.
                                 if !done {
                                     state.execution_shard += 1;
                                 }
@@ -607,9 +614,26 @@ where
     runtime.subproof_verifier = Some(&noop);
 
     // Execute from the checkpoint.
-    let (records, _) = runtime.execute_record(true).unwrap();
+    let (records, done) = runtime.execute_record(true).unwrap();
 
-    (records.into_iter().map(|r| *r).collect(), runtime.report)
+    let mut records = records.into_iter().map(|r| *r).collect::<Vec<_>>();
+    let pv = records.last().unwrap().public_values;
+
+    // Handle the case where the COMMIT happens across the last two shards.
+    if !done &&
+        (pv.committed_value_digest.iter().any(|v| *v != 0) ||
+            pv.deferred_proofs_digest.iter().any(|v| *v != 0))
+    {
+        // We turn off the `print_report` flag to avoid modifying the report.
+        runtime.print_report = false;
+        let (_, next_pv, _) = runtime.execute_state(true).unwrap();
+        for record in records.iter_mut() {
+            record.public_values.committed_value_digest = next_pv.committed_value_digest;
+            record.public_values.deferred_proofs_digest = next_pv.deferred_proofs_digest;
+        }
+    }
+
+    (records, runtime.report)
 }
 
 #[derive(Error, Debug)]

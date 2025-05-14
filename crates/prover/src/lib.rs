@@ -82,10 +82,11 @@ use sp1_recursion_core::{
 pub use sp1_recursion_gnark_ffi::proof::{Groth16Bn254Proof, PlonkBn254Proof};
 use sp1_recursion_gnark_ffi::{groth16_bn254::Groth16Bn254Prover, plonk_bn254::PlonkBn254Prover};
 use sp1_stark::{
-    baby_bear_poseidon2::BabyBearPoseidon2, shape::Shape, Challenge, MachineProver, SP1ProverOpts,
-    ShardProof, SplitOpts, StarkGenericConfig, StarkVerifyingKey, Val, Word, DIGEST_SIZE,
+    baby_bear_poseidon2::BabyBearPoseidon2,
+    shape::{OrderedShape, Shape},
+    Challenge, MachineProver, MachineProvingKey, SP1ProverOpts, ShardProof, SplitOpts,
+    StarkGenericConfig, StarkVerifyingKey, Val, Word, DIGEST_SIZE,
 };
-use sp1_stark::{shape::OrderedShape, MachineProvingKey};
 use tracing::instrument;
 
 pub use types::*;
@@ -447,7 +448,8 @@ impl<C: SP1ProverComponents> SP1Prover<C> {
                     let recursion_shape =
                         SP1RecursionShape { proof_shapes: vec![shape], is_complete };
 
-                    // Only need to compile the recursion program if we're not in the one-shard case.
+                    // Only need to compile the recursion program if we're not in the one-shard
+                    // case.
                     let compress_shape = SP1CompressProgramShape::Recursion(recursion_shape);
 
                     // Insert the program into the cache.
@@ -1029,9 +1031,14 @@ impl<C: SP1ProverComponents> SP1Prover<C> {
         &self,
         input: &SP1RecursionWitnessValues<CoreSC>,
     ) -> Arc<RecursionProgram<BabyBear>> {
+        // Check if the program is in the cache.
         let mut cache = self.lift_programs_lru.lock().unwrap_or_else(|e| e.into_inner());
-        cache
-            .get_or_insert(input.shape(), || {
+        let shape = input.shape();
+        let program = cache.get(&shape).cloned();
+        drop(cache);
+        match program {
+            Some(program) => program,
+            None => {
                 let misses = self.lift_cache_misses.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("core cache miss, misses: {}", misses);
                 // Get the operations.
@@ -1059,9 +1066,14 @@ impl<C: SP1ProverComponents> SP1Prover<C> {
                 }
                 let program = Arc::new(program);
                 compiler_span.exit();
+
+                // Insert the program into the cache.
+                let mut cache = self.lift_programs_lru.lock().unwrap_or_else(|e| e.into_inner());
+                cache.put(shape, program.clone());
+                drop(cache);
                 program
-            })
-            .clone()
+            }
+        }
     }
 
     pub fn compress_program(
